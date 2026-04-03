@@ -1,0 +1,254 @@
+---
+- name: Deploy python in Docker on EC2
+  hosts: all
+  become: yes
+  vars:
+    app_dir: /opt/app
+    ansible_user: ubuntu
+
+  tasks:
+    - name: Install apt dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu jammy stable"
+        state: present
+
+    - name: Install Docker CE
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Start and enable Docker
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add ubuntu user to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Reset SSH connection so group change takes effect
+      meta: reset_connection
+
+    - name: Install local DB if requested (postgres)
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+        state: present
+        update_cache: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'postgres'
+
+    - name: Start and enable postgresql
+      systemd:
+        name: postgresql
+        state: started
+        enabled: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'postgres'
+
+    - name: Fix postgres SCRAM auth to md5
+      shell: |
+        HBA=$(sudo find /etc/postgresql -name pg_hba.conf | head -1)
+        sudo sed -i 's/scram-sha-256/md5/g' $HBA
+        sudo systemctl reload postgresql
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'postgres'
+
+    - name: Create postgres database
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE DATABASE {{ db_name }};"
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'postgres'
+
+    - name: Create postgres user
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_username }}'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE USER {{ db_username }} WITH ENCRYPTED PASSWORD '{{ db_password }}';"
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'postgres'
+
+    - name: Grant postgres privileges
+      shell: |
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_username }};"
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'postgres'
+
+    - name: Install mysql if requested
+      apt:
+        name:
+          - mysql-server
+        state: present
+        update_cache: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mysql'
+
+    - name: Start and enable mysql
+      systemd:
+        name: mysql
+        state: started
+        enabled: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mysql'
+
+    - name: Create mysql database
+      shell: |
+        mysql -u root -e "CREATE DATABASE IF NOT EXISTS {{ db_name }};"
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mysql'
+
+    - name: Create mysql user and grant privileges
+      shell: |
+        mysql -u root -e "CREATE USER IF NOT EXISTS '{{ db_username }}'@'localhost' IDENTIFIED BY '{{ db_password }}'; GRANT ALL ON {{ db_name }}.* TO '{{ db_username }}'@'localhost'; FLUSH PRIVILEGES;"
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mysql'
+
+    - name: Install gnupg and curl for mongodb
+      apt:
+        name:
+          - gnupg
+          - curl
+        state: present
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mongodb'
+
+    - name: Add MongoDB GPG key
+      shell: |
+        curl -fsSL https://pgp.mongodb.com/server-7.0.asc | sudo gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor
+      args:
+        creates: /usr/share/keyrings/mongodb-server-7.0.gpg
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mongodb'
+
+    - name: Add MongoDB repository
+      shell: |
+        echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mongodb'
+
+    - name: Install mongodb-org
+      apt:
+        name:
+          - mongodb-org
+        state: present
+        update_cache: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mongodb'
+
+    - name: Start and enable mongod
+      systemd:
+        name: mongod
+        state: started
+        enabled: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mongodb'
+
+    - name: Create mongodb database
+      shell: |
+        mongosh --eval 'db.getSiblingDB("{{ db_name }}").createCollection("init")'
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mongodb'
+
+    - name: Wipe old app directory
+      file:
+        path: "{{ app_dir }}"
+        state: absent
+      ignore_errors: yes
+
+    - name: Recreate app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Copy all project files to app directory
+      copy:
+        src: ../
+        dest: "{{ app_dir }}/"
+        mode: '0755'
+
+    - name: Write .env file with database secrets
+      copy:
+        content: |
+          DATABASE_URL={{ database_url | default('') }}
+          MONGO_URI={{ mongo_uri | default('') }}
+          DB_HOST={{ db_host | default('') }}
+          DB_PORT={{ db_port | default('') }}
+          DB_NAME={{ db_name | default('') }}
+          DB_USER={{ db_user | default('') }}
+          DB_PASSWORD={{ db_password | default('') }}
+        dest: "{{ app_dir }}/.env"
+        mode: '0600'
+
+    - name: Write Dockerfile for python app
+      copy:
+        content: |
+          FROM python:3.12-slim
+          WORKDIR /app
+          COPY . /app/
+          RUN pip install --no-cache-dir -r requirements.txt || true
+          EXPOSE 8000
+          CMD ["gunicorn", "main:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000"]
+        dest: "{{ app_dir }}/Dockerfile"
+        mode: '0644'
+
+    - name: Stop existing python-app container
+      shell: docker stop python-app || true
+
+    - name: Remove existing python-app container
+      shell: docker rm python-app || true
+
+    - name: Remove old python-app image to force rebuild
+      shell: docker rmi python-app:latest || true
+
+    - name: Build python-app Docker image
+      shell: docker build --no-cache -t python-app:latest {{ app_dir }}/
+
+    - name: Run python-app container
+      shell: >
+        docker run -d
+        --name python-app
+        --env-file {{ app_dir }}/.env
+        -p 80:8000
+        --restart always
+        python-app:latest
+
+    - name: Wait for app to be ready
+      wait_for:
+        host: 127.0.0.1
+        port: 8000
+        timeout: 120
+        delay: 10
+      register: wait_result
+      ignore_errors: yes
+
+    - name: Show docker logs if app did not start
+      shell: docker logs python-app
+      when: wait_result is failed
+
+    - name: Verify python-app container is running
+      shell: docker ps --filter name=python-app --filter status=running --format '{{ '{{' }}.Names{{ '}}' }}'
+      register: container_check
+      retries: 3
+      delay: 5
+      until: container_check.stdout != ""
+      become: yes
+
+    - name: Print server IP on success
+      debug:
+        msg: "server_ip={{ ansible_host }}"
