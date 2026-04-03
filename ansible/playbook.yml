@@ -227,6 +227,7 @@
         -p 80:8000
         --restart always
         python-app:latest
+        || docker start python-app
 
     - name: Wait for app to be ready
       wait_for:
