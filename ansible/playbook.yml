@@ -232,7 +232,7 @@
     - name: Wait for app to be ready
       wait_for:
         host: 127.0.0.1
-        port: 8000
+        port: 80
         timeout: 120
         delay: 10
       register: wait_result
